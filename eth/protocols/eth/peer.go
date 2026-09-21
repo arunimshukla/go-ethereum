@@ -565,6 +565,12 @@ func (p *Peer) bufferReceipts(requestId uint64, receiptLists []*ReceiptList, las
 		if len(buffer.list) > 0 {
 			lastBlock += len(buffer.list) - 1
 		}
+		// The block the response ends on is derived from peer supplied counts, so
+		// bound it against the request before it indexes the per-block metadata.
+		if lastBlock >= len(buffer.request) {
+			delete(p.receiptBuffer, requestId)
+			return fmt.Errorf("receipt response covers %d blocks, only %d requested", lastBlock+1, len(buffer.request))
+		}
 		gasUsed := buffer.gasUsed[lastBlock]
 		timestamp := buffer.timestamps[lastBlock]
 		logSize, err := p.validateLastBlockReceipt(receiptLists, requestId, gasUsed, timestamp)
