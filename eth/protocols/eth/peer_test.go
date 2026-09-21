@@ -104,6 +104,54 @@ func TestBufferReceiptsNoProgress(t *testing.T) {
 	}
 }
 
+// TestBufferReceiptsOverLongResponse checks that an incomplete receipt response
+// claiming more blocks than were requested is rejected. The block the response
+// ends on is derived from counts the peer controls, and it indexes the per-block
+// gas and timestamp metadata recorded for the request.
+func TestBufferReceiptsOverLongResponse(t *testing.T) {
+	p := &Peer{receiptBuffer: make(map[uint64]*receiptRequest)}
+
+	// A single block requested, two blocks worth of receipts delivered.
+	p.receiptBuffer[1] = &receiptRequest{
+		request:    []common.Hash{{1}},
+		gasUsed:    []uint64{1_000_000},
+		timestamps: []uint64{0},
+	}
+	lists := []*ReceiptList{
+		NewReceiptList([]*types.Receipt{{Status: 1, CumulativeGasUsed: 21000}}),
+		NewReceiptList([]*types.Receipt{{Status: 1, CumulativeGasUsed: 42000}}),
+	}
+	if err := p.bufferReceipts(1, lists, true); err == nil {
+		t.Fatal("expected error for response covering more blocks than requested")
+	}
+	if _, ok := p.receiptBuffer[1]; ok {
+		t.Fatal("buffer entry not removed after invalid response")
+	}
+
+	// The same count is valid once the request actually covers both blocks.
+	p.receiptBuffer[2] = &receiptRequest{
+		request:    []common.Hash{{1}, {2}},
+		gasUsed:    []uint64{1_000_000, 1_000_000},
+		timestamps: []uint64{0, 0},
+	}
+	if err := p.bufferReceipts(2, lists, true); err != nil {
+		t.Fatalf("unexpected error for response within the requested range: %v", err)
+	}
+	if _, ok := p.receiptBuffer[2]; !ok {
+		t.Fatal("buffer entry missing after valid incomplete response")
+	}
+
+	// A continuation may not run past the end of the request either: the first
+	// list continues the buffered block, so two more lists reach block 3 of a
+	// two-block request.
+	if err := p.bufferReceipts(2, lists, true); err == nil {
+		t.Fatal("expected error for continuation past the end of the request")
+	}
+	if _, ok := p.receiptBuffer[2]; ok {
+		t.Fatal("buffer entry not removed after invalid continuation")
+	}
+}
+
 func TestPeerSet(t *testing.T) {
 	size := 5
 	s := newKnownCache(size)
