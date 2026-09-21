@@ -54,6 +54,7 @@ type testPeerV2 struct {
 	test          *testing.T
 	remote        *syncerV2
 	logger        log.Logger
+	trieLock      sync.Mutex
 	accountTrie   *trie.Trie
 	accountValues []*kv
 	storageTries  map[common.Hash]*trie.Trie
@@ -139,6 +140,9 @@ func (t *testPeerV2) RequestAccessLists(id uint64, hashes []common.Hash, bytes i
 }
 
 func createAccountRequestResponseV2(t *testPeerV2, root common.Hash, origin common.Hash, limit common.Hash, cap int) (keys []common.Hash, vals [][]byte, proofs [][]byte) {
+	t.trieLock.Lock()
+	defer t.trieLock.Unlock()
+
 	var size int
 	if limit == (common.Hash{}) {
 		limit = common.MaxHash
@@ -170,6 +174,9 @@ func createAccountRequestResponseV2(t *testPeerV2, root common.Hash, origin comm
 }
 
 func createStorageRequestResponseV2(t *testPeerV2, root common.Hash, accounts []common.Hash, origin, limit []byte, max int) (hashes [][]common.Hash, slots [][][]byte, proofs [][]byte) {
+	t.trieLock.Lock()
+	defer t.trieLock.Unlock()
+
 	var size int
 	for _, account := range accounts {
 		var originHash common.Hash
@@ -225,6 +232,9 @@ func createStorageRequestResponseV2(t *testPeerV2, root common.Hash, accounts []
 }
 
 func createStorageRequestResponseAlwaysProveV2(t *testPeerV2, root common.Hash, accounts []common.Hash, bOrigin, bLimit []byte, max int) (hashes [][]common.Hash, slots [][][]byte, proofs [][]byte) {
+	t.trieLock.Lock()
+	defer t.trieLock.Unlock()
+
 	var size int
 	max = max * 3 / 4
 
@@ -277,6 +287,42 @@ func createStorageRequestResponseAlwaysProveV2(t *testPeerV2, root common.Hash, 
 func defaultAccountRequestHandlerV2(t *testPeerV2, id uint64, root common.Hash, origin common.Hash, limit common.Hash, cap int) error {
 	keys, vals, proofs := createAccountRequestResponseV2(t, root, origin, limit, cap)
 	if err := t.remote.OnAccounts(t, id, keys, vals, proofs); err != nil {
+		t.test.Errorf("Remote side rejected our delivery: %v", err)
+		t.term()
+		return err
+	}
+	return nil
+}
+
+// createFullAccountRangeResponseV2 is like createAccountRequestResponseV2, but never attaches a proof.
+func createFullAccountRangeResponseV2(t *testPeerV2, root common.Hash, origin common.Hash, limit common.Hash) (keys []common.Hash, vals [][]byte) {
+	if limit == (common.Hash{}) {
+		limit = common.MaxHash
+	}
+	for _, entry := range t.accountValues {
+		if bytes.Compare(origin[:], entry.k) <= 0 {
+			keys = append(keys, common.BytesToHash(entry.k))
+			vals = append(vals, entry.v)
+		}
+		if bytes.Compare(entry.k, limit[:]) >= 0 {
+			break
+		}
+	}
+	return keys, vals
+}
+
+// fullAccountRangeRequestHandlerV2 answers the origin-zero request without a proof, and every other chunk normally.
+func fullAccountRangeRequestHandlerV2(t *testPeerV2, id uint64, root common.Hash, origin common.Hash, limit common.Hash, cap int) error {
+	if origin != (common.Hash{}) {
+		return defaultAccountRequestHandlerV2(t, id, root, origin, limit, cap)
+	}
+	keys, vals := createFullAccountRangeResponseV2(t, root, origin, limit)
+	if len(keys) != len(t.accountValues) {
+		t.test.Errorf("proof-less range must cover the whole state, got %d of %d accounts", len(keys), len(t.accountValues))
+		t.term()
+		return nil
+	}
+	if err := t.remote.OnAccounts(t, id, keys, vals, nil); err != nil {
 		t.test.Errorf("Remote side rejected our delivery: %v", err)
 		t.term()
 		return err
@@ -543,6 +589,86 @@ func testSyncV2(t *testing.T, scheme string) {
 	syncer := setupSyncerV2(nodeScheme, mkSource("source"))
 	if err := syncer.Sync(mkPivot(0, sourceAccountTrie.Hash()), cancel); err != nil {
 		t.Fatalf("sync failed: %v", err)
+	}
+	verifyTrie(scheme, syncer.db, sourceAccountTrie.Hash(), t)
+	verifyAdoptedSyncedState(scheme, syncer.db, sourceAccountTrie.Hash(), elems, t)
+}
+
+// TestSyncV2FullAccountRangeNoProof tests sync against a peer that omits the proof for the
+// origin-zero request, which the spec permits when the whole state fits in one response.
+func TestSyncV2FullAccountRangeNoProof(t *testing.T) {
+	t.Parallel()
+
+	testSyncV2FullAccountRangeNoProof(t, rawdb.HashScheme)
+	testSyncV2FullAccountRangeNoProof(t, rawdb.PathScheme)
+}
+
+func testSyncV2FullAccountRangeNoProof(t *testing.T, scheme string) {
+	var (
+		once   sync.Once
+		cancel = make(chan struct{})
+		term   = func() { once.Do(func() { close(cancel) }) }
+	)
+	// key32(i) puts i in the top key byte, so keys 1..15 sit below the first chunk.
+	nodeScheme, sourceAccountTrie, elems := makeAccountTrieNoStorage(15, scheme)
+
+	mkSource := func(name string) *testPeerV2 {
+		source := newTestPeerV2(name, t, term)
+		source.accountTrie = sourceAccountTrie.Copy()
+		source.accountValues = elems
+		source.accountRequestV2Handler = fullAccountRangeRequestHandlerV2
+		return source
+	}
+	syncer := setupSyncerV2(nodeScheme, mkSource("source"))
+	if err := syncer.Sync(mkPivot(0, sourceAccountTrie.Hash()), cancel); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	verifyTrie(scheme, syncer.db, sourceAccountTrie.Hash(), t)
+	verifyAdoptedSyncedState(scheme, syncer.db, sourceAccountTrie.Hash(), elems, t)
+}
+
+// TestSyncV2AccountRangeNoProofNonZeroOrigin tests sync against a peer that omits the proof
+// for a non-zero origin, which the spec does not permit, so it must be refused.
+func TestSyncV2AccountRangeNoProofNonZeroOrigin(t *testing.T) {
+	t.Parallel()
+
+	testSyncV2AccountRangeNoProofNonZeroOrigin(t, rawdb.HashScheme)
+	testSyncV2AccountRangeNoProofNonZeroOrigin(t, rawdb.PathScheme)
+}
+
+func testSyncV2AccountRangeNoProofNonZeroOrigin(t *testing.T, scheme string) {
+	var (
+		once   sync.Once
+		cancel = make(chan struct{})
+		term   = func() { once.Do(func() { close(cancel) }) }
+	)
+	nodeScheme, sourceAccountTrie, elems := makeAccountTrieNoStorage(100, scheme)
+
+	var delivered, rejected atomic.Bool
+
+	source := newTestPeerV2("source", t, term)
+	source.accountTrie = sourceAccountTrie.Copy()
+	source.accountValues = elems
+	source.accountRequestV2Handler = func(t *testPeerV2, id uint64, root, origin, limit common.Hash, cap int) error {
+		if origin == (common.Hash{}) || !delivered.CompareAndSwap(false, true) {
+			return defaultAccountRequestHandlerV2(t, id, root, origin, limit, cap)
+		}
+		keys, vals := createFullAccountRangeResponseV2(t, root, common.Hash{}, common.MaxHash)
+		rejected.Store(t.remote.OnAccounts(t, id, keys, vals, nil) != nil)
+		return nil
+	}
+	syncer := setupSyncerV2(nodeScheme, source)
+	done := checkStall(t, term)
+	if err := syncer.Sync(mkPivot(0, sourceAccountTrie.Hash()), cancel); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	close(done)
+
+	if !delivered.Load() {
+		t.Fatal("no account range request with a non-zero origin was issued")
+	}
+	if !rejected.Load() {
+		t.Fatal("proof-less account range with a non-zero origin was accepted")
 	}
 	verifyTrie(scheme, syncer.db, sourceAccountTrie.Hash(), t)
 	verifyAdoptedSyncedState(scheme, syncer.db, sourceAccountTrie.Hash(), elems, t)
